@@ -9,6 +9,16 @@ android {
 
     defaultConfig {
         minSdk = 26
+
+        externalNativeBuild {
+            cmake {
+                arguments("-DANDROID_STL=c++_shared")
+            }
+        }
+    }
+
+    buildFeatures {
+        prefab = true
     }
 
     externalNativeBuild {
@@ -25,4 +35,7 @@ android {
 
 dependencies {
     implementation(project(":core-model"))
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.oboe)
 }
