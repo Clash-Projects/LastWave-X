@@ -1,9 +1,16 @@
 package com.clashprojects.lastwave.innertube
 
 import com.clashprojects.lastwave.innertube.auth.InMemoryTubeCredentialStore
+import com.clashprojects.lastwave.innertube.auth.PremiumDetector
 import com.clashprojects.lastwave.innertube.auth.TubeAuthManager
 import com.clashprojects.lastwave.innertube.auth.hasAuthCookie
 import com.clashprojects.lastwave.innertube.auth.isSessionExpiredStatus
+import com.clashprojects.lastwave.innertube.cipher.PlayerCipherEngine
+import com.clashprojects.lastwave.innertube.extract.AudioQuality
+import com.clashprojects.lastwave.innertube.extract.ContentHints
+import com.clashprojects.lastwave.innertube.extract.ExtractedStream
+import com.clashprojects.lastwave.innertube.extract.StreamExtractor
+import com.clashprojects.lastwave.innertube.extract.StreamResolveException
 import com.clashprojects.lastwave.innertube.model.TubeClient
 import com.clashprojects.lastwave.innertube.net.DohProvider
 import com.clashprojects.lastwave.innertube.net.TubeHttpConfig
@@ -23,13 +30,14 @@ import io.ktor.http.headersOf
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.test.runTest
 import okhttp3.OkHttpClient
+import org.junit.Test
 import java.net.InetAddress
 import java.net.UnknownHostException
-import org.junit.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class WaveTubeModuleTest {
@@ -67,6 +75,7 @@ class WaveTubeModuleTest {
                 visitorData = "Cgt2aXNpdG9y",
                 dataSyncId = "sync_1",
                 authUser = "2",
+                detectedPremium = false,
             )
             assertTrue(auth.isSignedIn)
             assertEquals("2", tube.authUser)
@@ -82,8 +91,94 @@ class WaveTubeModuleTest {
             assertFalse(auth.sessionExpired.value)
             assertEquals("", store.read().cookie)
 
+            auth.close()
             tube.close()
             ktor.close()
+        }
+
+    @Test
+    fun premiumDetectorRecognizesHeaderLogosAndItags() {
+        assertEquals(true, PremiumDetector.detectFromJson("""{"iconType":"MUSIC_PREMIUM_LOGO"}"""))
+        assertEquals(false, PremiumDetector.detectFromJson("""{"panelId":"PApremium_upsell"}"""))
+        assertNull(PremiumDetector.detectFromJson("""{"responseContext":{}}"""))
+
+        assertTrue(PremiumDetector.isPremiumStream(fakeStream(itag = 774, bitrate = 256_000)))
+        assertTrue(PremiumDetector.isPremiumStream(fakeStream(itag = 141, bitrate = 256_000)))
+        assertFalse(PremiumDetector.isPremiumStream(fakeStream(itag = 251, bitrate = 135_000)))
+    }
+
+    @Test
+    fun resolveStreamFallsBackToNormalPlaybackWhenPremiumRouteFails() =
+        runTest {
+            val mockEngine =
+                MockEngine {
+                    respond(
+                        content = """{"responseContext":{}}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                    )
+                }
+            val ktor =
+                HttpClient(mockEngine) {
+                    install(ContentNegotiation) { json(TubeHttpFactory.defaultJson) }
+                }
+            val tube = WaveTube(ktor)
+            val auth = TubeAuthManager(tube, InMemoryTubeCredentialStore())
+            auth.saveCredentials(
+                cookie = "SAPISID=token_abc",
+                visitorData = "Cgt2aXNpdG9y",
+                detectedPremium = true,
+            )
+            assertTrue(auth.isPremium.value)
+
+            val calls = mutableListOf<Pair<Boolean, AudioQuality>>()
+            val fakeExtractor =
+                object : StreamExtractor {
+                    override suspend fun extract(
+                        videoId: String,
+                        hints: ContentHints,
+                        excludedClients: Set<String>,
+                        audioQuality: AudioQuality,
+                        clientPlaybackNonce: String,
+                    ): ExtractedStream? {
+                        calls += hints.premium to audioQuality
+                        if (hints.premium) {
+                            throw StreamResolveException(
+                                StreamResolveException.Reason.NO_PLAYABLE_STREAM,
+                                "simulated premium client failure",
+                            )
+                        }
+                        return fakeStream(itag = 251, bitrate = 140_000, clientName = "ANDROID_VR")
+                    }
+
+                    override suspend fun prewarm() = Unit
+                }
+
+            val client =
+                WaveTubeClient(
+                    okHttpClient = OkHttpClient(),
+                    httpClient = ktor,
+                    tube = tube,
+                    cipherEngine = PlayerCipherEngine(ktor),
+                    extractor = fakeExtractor,
+                    auth = auth,
+                )
+
+            val resolved = client.resolveStream("dQw4w9WgXcQ")
+            assertNotNull(resolved)
+            assertEquals(251, resolved.itag)
+            assertEquals(listOf(true to AudioQuality.HIGH, false to AudioQuality.AUTO), calls)
+
+            // Passive observation on an authenticated 256kbps stream re-confirms Premium; 3 standard auth streams downgrade.
+            auth.observeResolvedStream(fakeStream(itag = 251, bitrate = 130_000, clientName = "WEB_REMIX"))
+            auth.observeResolvedStream(fakeStream(itag = 251, bitrate = 130_000, clientName = "WEB_REMIX"))
+            assertTrue(auth.isPremium.value)
+            auth.observeResolvedStream(fakeStream(itag = 251, bitrate = 130_000, clientName = "WEB_REMIX"))
+            assertFalse(auth.isPremium.value)
+            auth.observeResolvedStream(fakeStream(itag = 774, bitrate = 256_000, clientName = "WEB_REMIX"))
+            assertTrue(auth.isPremium.value)
+
+            client.close()
         }
 
     @Test
@@ -145,4 +240,26 @@ class WaveTubeModuleTest {
             assertNotNull(client.cipherEngine)
             client.close()
         }
+
+    private fun fakeStream(
+        itag: Int,
+        bitrate: Int,
+        clientName: String = "WEB_REMIX",
+    ) = ExtractedStream(
+        videoId = "dQw4w9WgXcQ",
+        audioUrl = "https://rr1---sn.googlevideo.com/videoplayback?itag=$itag",
+        headers = emptyMap(),
+        loudnessDb = null,
+        expiresAt = null,
+        contentLengthBytes = null,
+        itag = itag,
+        mimeType = "audio/webm",
+        codecs = "opus",
+        bitrate = bitrate,
+        sampleRate = 48_000,
+        clientName = clientName,
+        profileId = clientName,
+        requireBoundedRange = false,
+        rangeChunkSizeBytes = 0L,
+    )
 }
