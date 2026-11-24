@@ -17,6 +17,12 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        maven {
+            setUrl("https://jitpack.io")
+            content {
+                includeGroup("com.github.MetrolistGroup.quackjs")
+            }
+        }
     }
 }
 
